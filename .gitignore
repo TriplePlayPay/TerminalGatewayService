@@ -1,5 +1,7 @@
 .idea
-
+aws/
+awscliv2.zip
+aws
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
