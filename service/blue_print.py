@@ -188,112 +188,112 @@ async def charge(request: Request) -> JSONResponse:
                     "amount": "0.00",
                 })
 
-        message = {
-            "action": "charge",
-            "request_id": request_input.reference,
-            "laneId": terminal_id,
-            "amount": float(request_input.amount),
-            "terminal_payment_type": request_input.terminal_payment_type,
-        }
+    message = {
+        "action": "charge",
+        "request_id": request_input.reference,
+        "laneId": terminal_id,
+        "amount": float(request_input.amount),
+        "terminal_payment_type": request_input.terminal_payment_type,
+    }
 
-        def __evaluate_details(details: Dict[str, Any]) -> bool:
-            """
-            Basically tells us if a request is successful based on its details
-            :param details: Dict[str, Any]
-            :return: bool
-            """
-            device_response_code = details.get("DeviceResponseCode")
-            if not device_response_code:
-                logger.error(f"No device response code present in: {details}")
-                raise ValueError("No Device Response Code Available In Response")
+    def __evaluate_details(details: Dict[str, Any]) -> bool:
+        """
+        Basically tells us if a request is successful based on its details
+        :param details: Dict[str, Any]
+        :return: bool
+        """
+        device_response_code = details.get("DeviceResponseCode")
+        if not device_response_code:
+            logger.error(f"No device response code present in: {details}")
+            raise ValueError("No Device Response Code Available In Response")
 
-            if device_response_code != "000000":
-                logger.error(f"Non Zero Response Code In: {details}")
-                return False
+        if device_response_code != "000000":
+            logger.error(f"Non Zero Response Code In: {details}")
+            return False
 
-            return True
+        return True
 
-        # Create a Future so we can wait for the response
-        fut = asyncio.get_event_loop().create_future()
+    # Create a Future so we can wait for the response
+    fut = asyncio.get_event_loop().create_future()
 
-        send_success = False
-        for attempt in range(1, 4):  # up to 3 attempts
-            try:
-                # Store the Future in pending_requests
-                PAX_CONNECTIONS[terminal_id]["pending_requests"][request_input.reference] = fut
-
-                # Pull the latest WebSocket in case it changed
-                ws = PAX_CONNECTIONS[terminal_id]["websocket"]
-
-                # Attempt to send
-                await ws.send(OG_JSON.dumps(message))
-
-                # If it works, break out of the loop
-                send_success = True
-                break
-            except Exception as e:
-                logger.error(
-                    f"Attempt {attempt} to send WebSocket message failed for terminal {terminal_id}. "
-                    f"Error: {e}"
-                )
-                logger.exception(
-                    f"Attempt {attempt} to send WebSocket message failed for terminal {terminal_id}."
-                )
-                # Optionally sleep a short time before retrying
-                # (This is up to you)
-                await asyncio.sleep(1)
-
-        # If after 3 attempts we still haven't succeeded, handle it
-        if not send_success:
-            logger.error(f"Unable to submit to lane id: {terminal_id}")
-            # We can remove this future from pending_requests since we never sent the request
-            # (No device can possibly respond to a message that never went out)
-            PAX_CONNECTIONS[terminal_id]["pending_requests"].pop(request_input.reference, None)
-
-            return json({
-                "status": False,
-                "message": (
-                    "Intermittent issue communicating with the terminal. "
-                    "Please wait a few moments and retry. If the issue persists, "
-                    "please restart the Windows desktop application."
-                ),
-                "laneId": terminal_id,
-                "amount": request_input.amount,
-            })
-
+    send_success = False
+    for attempt in range(1, 4):  # up to 3 attempts
         try:
-            # Await the response from the device or time out
-            response = await asyncio.wait_for(fut, timeout=270)
-            # You can shape the final return dict to match your format
-            """
-            {
-                "status": True,
-                "amount": payload.get("amount", "0.00"),
-                "fee": payload.get("fee", "0.00"),
-                "tip": payload.get("tip", "0.00"),
-                "message": {
-                    "amount": 0,
-                },
-                "details": {"authorization_id": self.reference},
-                "receipt": [],
-            }
-            """
-            response_details = response.get("details")
-            is_successful = __evaluate_details(response_details)
-            return json({
-                "status": is_successful,
-                "message": response.get("message", ""),
-                "laneId": terminal_id,
-                "amount": request_input.amount,
-                "fee": response.get("fee", "0.00"),
-                "tip": response.get("tip", "0.00"),
-                "receipt": [],
-                "details": response.get("details"),
-            })
-        except asyncio.TimeoutError:
-            return json({
-                "status": False,
-                "message": "Timeout waiting for PAX terminal response",
-                "laneId": terminal_id,
-                "amount": request_input.amount,
-            })
+            # Store the Future in pending_requests
+            PAX_CONNECTIONS[terminal_id]["pending_requests"][request_input.reference] = fut
+
+            # Pull the latest WebSocket in case it changed
+            ws = PAX_CONNECTIONS[terminal_id]["websocket"]
+
+            # Attempt to send
+            await ws.send(OG_JSON.dumps(message))
+
+            # If it works, break out of the loop
+            send_success = True
+            break
+        except Exception as e:
+            logger.error(
+                f"Attempt {attempt} to send WebSocket message failed for terminal {terminal_id}. "
+                f"Error: {e}"
+            )
+            logger.exception(
+                f"Attempt {attempt} to send WebSocket message failed for terminal {terminal_id}."
+            )
+            # Optionally sleep a short time before retrying
+            # (This is up to you)
+            await asyncio.sleep(1)
+
+    # If after 3 attempts we still haven't succeeded, handle it
+    if not send_success:
+        logger.error(f"Unable to submit to lane id: {terminal_id}")
+        # We can remove this future from pending_requests since we never sent the request
+        # (No device can possibly respond to a message that never went out)
+        PAX_CONNECTIONS[terminal_id]["pending_requests"].pop(request_input.reference, None)
+
+        return json({
+            "status": False,
+            "message": (
+                "Intermittent issue communicating with the terminal. "
+                "Please wait a few moments and retry. If the issue persists, "
+                "please restart the Windows desktop application."
+            ),
+            "laneId": terminal_id,
+            "amount": request_input.amount,
+        })
+
+    try:
+        # Await the response from the device or time out
+        response = await asyncio.wait_for(fut, timeout=270)
+        # You can shape the final return dict to match your format
+        """
+        {
+            "status": True,
+            "amount": payload.get("amount", "0.00"),
+            "fee": payload.get("fee", "0.00"),
+            "tip": payload.get("tip", "0.00"),
+            "message": {
+                "amount": 0,
+            },
+            "details": {"authorization_id": self.reference},
+            "receipt": [],
+        }
+        """
+        response_details = response.get("details")
+        is_successful = __evaluate_details(response_details)
+        return json({
+            "status": is_successful,
+            "message": response.get("message", ""),
+            "laneId": terminal_id,
+            "amount": request_input.amount,
+            "fee": response.get("fee", "0.00"),
+            "tip": response.get("tip", "0.00"),
+            "receipt": [],
+            "details": response.get("details"),
+        })
+    except asyncio.TimeoutError:
+        return json({
+            "status": False,
+            "message": "Timeout waiting for PAX terminal response",
+            "laneId": terminal_id,
+            "amount": request_input.amount,
+        })
