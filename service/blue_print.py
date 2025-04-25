@@ -1,6 +1,6 @@
 import asyncio
 import json as OG_JSON
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 
 from sanic import json, Request, SanicException, Websocket, Blueprint
@@ -37,6 +37,7 @@ class ChargeRequestInput(BaseRequestInput):
     laneId: str
     terminal_payment_type: str
     terminal_type: str
+    order_identifier: Optional[str] = ""
 
 
 @bp.websocket("/")
@@ -196,6 +197,7 @@ async def charge(request: Request) -> JSONResponse:
         "amount": float(request_input.amount),
         "terminal_payment_type": request_input.terminal_payment_type,
         "terminal_type": request_input.terminal_type,
+        "orderIdentifier": request_input.order_identifier,
     }
 
     def __evaluate_details(details: Dict[str, Any]) -> bool:
