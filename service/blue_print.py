@@ -37,6 +37,7 @@ class ChargeRequestInput(BaseRequestInput):
     laneId: str
     terminal_payment_type: str
     terminal_type: str
+    mid_override: Optional[str] = "",
     order_identifier: Optional[str] = ""
 
 
@@ -199,6 +200,7 @@ async def charge(request: Request) -> JSONResponse:
         "terminal_type": request_input.terminal_type,
         "orderIdentifier": request_input.order_identifier,
         "merchantKey": api_key,
+        "mid_override": request_input.mid_override
     }
 
     def __evaluate_details(details: Dict[str, Any]) -> bool:
