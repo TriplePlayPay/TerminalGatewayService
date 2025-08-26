@@ -22,6 +22,13 @@ TERMINAL_LOOKUP_BACKOFF_BASE = 3  # seconds, exponential
 SEND_MAX_ATTEMPTS = 3
 
 
+def _mask(k: Optional[str]) -> str:
+    if not k:
+        return ""
+    if len(k) <= 10:
+        return k[:2] + "***"
+    return f"{k[:6]}...{k[-4:]}"
+
 
 def _evaluate_pax_details(details: Dict[str, Any]) -> bool:
     """
@@ -190,108 +197,145 @@ async def pax_terminal_ws(request: Request, ws: Websocket):
 
 
 # ----------------------------
-# NEW: WebSocket charge endpoint
+# NEW: WebSocket charge endpoint (server-to-server)
 # ----------------------------
 @bp.websocket("/charge/ws")
 async def charge_ws(request: Request, ws: Websocket):
     """
-    WebSocket endpoint for your *server-to-server* caller (the other API).
-    Client must:
-      - Include Authorization header (Bearer <api_key>) in the WS handshake.
-      - Send a JSON message containing ChargeRequestInput fields.
+    WebSocket endpoint for your other API.
+    Auth: Prefer Authorization header; if missing (proxy strips it), we accept ApiKey/api_key/etc.
+          inside the FIRST valid JSON message (deferred auth).
     We keep the socket open, ignore any non-JSON frames, and only close after sending a final 'result'.
     """
-    # Authorize the caller using the WS handshake headers
+    peer = getattr(ws, "remote_addr", None)
+    logger.info(f"[GW] charge_ws connected from={peer} headers_present={list(request.headers.keys())}")
+
+    # Try header-based auth first; if absent or invalid, defer to first JSON payload
+    authorized_key: Optional[str] = None
     api_key = get_api_key_from_http_request(request)
-    is_authorized = await get_authorization_from_api_key(api_key)
-    if not is_authorized:
-        await ws.send(OG_JSON.dumps({"type": "result", "status": False, "message": "Unauthorized"}))
-        await ws.close()
-        return
+    if api_key:
+        try:
+            if await get_authorization_from_api_key(api_key):
+                authorized_key = api_key
+                logger.info(f"[GW] charge_ws header auth success apikey={_mask(api_key)}")
+            else:
+                logger.warning(f"[GW] charge_ws header auth FAILED apikey={_mask(api_key)} (will try deferred payload auth)")
+        except Exception:
+            logger.exception("[GW] charge_ws header auth raised; will try deferred payload auth")
 
     # Wait for the first valid JSON charge payload, ignoring any noise frames
     request_input: Optional[ChargeRequestInput] = None
     raw_payload: Optional[Dict[str, Any]] = None
-    while True:
+
+    try:
+        async for raw in ws:
+            raw_text = _coerce_text(raw)
+            if raw_text is None:
+                continue
+            try:
+                candidate = OG_JSON.loads(raw_text)
+            except OG_JSON.JSONDecodeError:
+                # Ignore invalid JSON (heartbeats etc.)
+                continue
+            except Exception:
+                logger.exception("[GW] Unexpected error parsing initial WS payload; ignoring frame")
+                continue
+
+            # Deferred auth support: allow ApiKey/api_key in the message
+            if not authorized_key:
+                msg_apikey = (
+                    candidate.get("publishable_key")
+                    or candidate.get("public_key")
+                    or candidate.get("apikey")
+                    or candidate.get("api_key")
+                    or candidate.get("ApiKey")
+                    or candidate.get("iframekey")
+                )
+                if msg_apikey:
+                    if await get_authorization_from_api_key(msg_apikey):
+                        authorized_key = msg_apikey
+                        logger.info(f"[GW] charge_ws deferred payload auth success apikey={_mask(msg_apikey)}")
+                    else:
+                        logger.error(f"[GW] charge_ws deferred payload auth FAILED apikey={_mask(msg_apikey)}")
+
+            # If still not authorized, keep listening (maybe a later frame includes auth + payload)
+            try:
+                request_input = ignore_properties(ChargeRequestInput, candidate)
+                raw_payload = candidate
+            except Exception as e:
+                logger.warning(f"[GW] JSON payload did not match ChargeRequestInput shape: {e}; ignoring frame")
+                continue
+
+            # We have a candidate charge payload; enforce auth now
+            if not authorized_key:
+                await ws.send(OG_JSON.dumps({"type": "result", "status": False, "message": "Unauthorized (no API key)"}))
+                await ws.close()
+                return
+
+            break  # we have payload + auth; proceed
+
+    except Exception:
+        logger.exception("[GW] Error receiving initial charge payload on WS")
         try:
-            raw = await asyncio.wait_for(ws.recv(), timeout=30)
-        except asyncio.TimeoutError:
-            await ws.send(OG_JSON.dumps({"type": "result", "status": False, "message": "No payload received"}))
-            await ws.close()
-            return
-        except Exception:
-            logger.exception("Error receiving initial charge payload on WS")
             await ws.send(OG_JSON.dumps({"type": "result", "status": False, "message": "WS receive error"}))
-            await ws.close()
-            return
-
-        raw_text = _coerce_text(raw)
-        if raw_text is None:
-            # Ignore non-text/undecodable frames
-            continue
-
-        try:
-            candidate = OG_JSON.loads(raw_text)
-        except OG_JSON.JSONDecodeError:
-            # Ignore invalid JSON (heartbeats etc.)
-            continue
         except Exception:
-            logger.exception("Unexpected error parsing initial WS payload; ignoring frame")
-            continue
-
+            pass
         try:
-            # Coerce into our dataclass (ignore extra keys)
-            request_input = ignore_properties(ChargeRequestInput, candidate)
-            raw_payload = candidate
-            break
-        except Exception as e:
-            # The frame was JSON but not the expected shape; keep waiting
-            logger.warning(f"JSON payload did not match ChargeRequestInput shape: {e}; ignoring frame")
-            continue
+            await ws.close()
+        except Exception:
+            pass
+        return
 
-    assert request_input is not None  # for type checkers
+    if not request_input:
+        # Should not happen, but safety
+        await ws.send(OG_JSON.dumps({"type": "result", "status": False, "message": "No valid payload received"}))
+        await ws.close()
+        return
+
     terminal_id = request_input.laneId
     reference = request_input.reference
 
-    # Informational ack
+    # Ack
     await ws.send(OG_JSON.dumps({
         "type": "ack",
         "request_id": reference,
         "laneId": terminal_id,
-        "message": "Charge received; searching for terminal"
+        "message": "Charge received; searching for terminal",
+        "connected_terminals": list(TERMINAL_CONNECTIONS.keys()),
     }))
 
-    # Try to locate the terminal with exponential backoff (and report progress)
+    # Locate terminal with backoff (and report progress)
     for attempt in range(1, TERMINAL_LOOKUP_MAX_RETRIES + 1):
         if terminal_id in TERMINAL_CONNECTIONS:
             await ws.send(OG_JSON.dumps({
                 "type": "info",
                 "request_id": reference,
                 "laneId": terminal_id,
-                "message": f"Terminal {terminal_id} found (attempt {attempt})"
+                "message": f"Terminal {terminal_id} found (attempt {attempt})",
+                "connected_terminals": list(TERMINAL_CONNECTIONS.keys()),
+                "pending_for_terminal": list(TERMINAL_CONNECTIONS[terminal_id]["pending_requests"].keys()),
             }))
             break
         else:
             if attempt < TERMINAL_LOOKUP_MAX_RETRIES:
                 backoff_seconds = TERMINAL_LOOKUP_BACKOFF_BASE ** attempt
                 logger.error(
-                    f"Attempt {attempt}/{TERMINAL_LOOKUP_MAX_RETRIES}: "
-                    f"Terminal {terminal_id} not found. Current connected terminals: {list(TERMINAL_CONNECTIONS.keys())}"
+                    f"[GW] Attempt {attempt}/{TERMINAL_LOOKUP_MAX_RETRIES}: Terminal {terminal_id} not found. "
+                    f"Connected: {list(TERMINAL_CONNECTIONS.keys())}"
                 )
                 await ws.send(OG_JSON.dumps({
                     "type": "info",
                     "request_id": reference,
                     "laneId": terminal_id,
-                    "message": f"Terminal not connected; retrying in {backoff_seconds}s"
+                    "message": f"Terminal not connected; retrying in {backoff_seconds}s",
+                    "connected_terminals": list(TERMINAL_CONNECTIONS.keys()),
                 }))
                 await asyncio.sleep(backoff_seconds)
             else:
                 await ws.send(OG_JSON.dumps({
                     "type": "result",
                     "status": False,
-                    "message": (
-                        f"Terminal {terminal_id} not connected. Please ensure the terminal is on and online."
-                    ),
+                    "message": f"Terminal {terminal_id} not connected. Ensure it is on and online.",
                     "laneId": terminal_id,
                     "amount": request_input.amount,
                     "request_id": reference,
@@ -299,7 +343,7 @@ async def charge_ws(request: Request, ws: Websocket):
                 await ws.close()
                 return
 
-    # Prepare message to send to the desktop terminal
+    # Prepare message to send to desktop terminal
     device_message = {
         "action": "charge",
         "request_id": reference,
@@ -308,13 +352,16 @@ async def charge_ws(request: Request, ws: Websocket):
         "terminal_payment_type": request_input.terminal_payment_type,
         "terminal_type": request_input.terminal_type,
         "orderIdentifier": request_input.order_identifier,
-        "merchantKey": api_key,
+        "merchantKey": authorized_key,  # <-- ensure device sees key even if header was missing
         "mid_override": request_input.mid_override,
     }
+    safe_device_log = {**device_message, "merchantKey": authorized_key}
 
     # Future to await the desktop device response
     fut = asyncio.get_event_loop().create_future()
     TERMINAL_CONNECTIONS[terminal_id]["pending_requests"][reference] = fut
+    logger.info(f"[GW] Stored pending future for terminal={terminal_id} reference={reference} "
+                f"pending_keys={list(TERMINAL_CONNECTIONS[terminal_id]['pending_requests'].keys())}")
 
     # Try to send to the terminal with a few retries
     send_success = False
@@ -322,14 +369,14 @@ async def charge_ws(request: Request, ws: Websocket):
         try:
             ws_terminal = TERMINAL_CONNECTIONS[terminal_id]["websocket"]
             await ws_terminal.send(OG_JSON.dumps(device_message))
+            logger.info(f"[GW] Sent to terminal {terminal_id} attempt={attempt} payload={safe_device_log}")
             send_success = True
             break
         except Exception as e:
-            logger.exception(f"Attempt {attempt} to send to terminal {terminal_id} failed: {e}")
+            logger.exception(f"[GW] Attempt {attempt} send->terminal {terminal_id} failed: {e}")
             await asyncio.sleep(1)
 
     if not send_success:
-        # Clean pending future since nothing was sent
         TERMINAL_CONNECTIONS[terminal_id]["pending_requests"].pop(reference, None)
         await ws.send(OG_JSON.dumps({
             "type": "result",
@@ -342,7 +389,7 @@ async def charge_ws(request: Request, ws: Websocket):
         await ws.close()
         return
 
-    # Await device response, ignoring any non-JSON noise from *this* WS (we never send noise here)
+    # Await device response
     try:
         response = await asyncio.wait_for(fut, timeout=WS_CHARGE_TIMEOUT_S)
         response_details = response.get("details") or {}
@@ -367,6 +414,7 @@ async def charge_ws(request: Request, ws: Websocket):
             "request_id": reference,
         }
         await ws.send(OG_JSON.dumps(final_payload))
+        logger.info(f"[GW] Final result sent for reference={reference} success={is_successful}")
     except asyncio.TimeoutError:
         await ws.send(OG_JSON.dumps({
             "type": "result",
@@ -376,8 +424,9 @@ async def charge_ws(request: Request, ws: Websocket):
             "amount": request_input.amount,
             "request_id": reference,
         }))
+        logger.warning(f"[GW] Timeout waiting for terminal response reference={reference}")
     except Exception:
-        logger.exception("Unhandled error in charge_ws")
+        logger.exception("[GW] Unhandled error in charge_ws")
         await ws.send(OG_JSON.dumps({
             "type": "result",
             "status": False,
@@ -387,7 +436,6 @@ async def charge_ws(request: Request, ws: Websocket):
             "request_id": reference,
         }))
     finally:
-        # This WS is single-shot: close after final result is sent
         try:
             await ws.close()
         except Exception:
